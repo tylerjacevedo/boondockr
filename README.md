@@ -1,81 +1,214 @@
-# 🏕️ Boondockr v1.1
-### Campsite Cancellation Notifier
+# 🏕️ Boondockr
 
-Boondockr watches recreation.gov 24/7 and instantly alerts you via email the second a campsite cancellation opens up — before anyone else can grab it.
+> Real-time campsite cancellation notifier built entirely on AWS
+
+[![Python](https://img.shields.io/badge/Python-3.11-3776ab?style=flat-square&logo=python&logoColor=white)](https://python.org)
+[![AWS EC2](https://img.shields.io/badge/AWS-EC2-ff9900?style=flat-square&logo=amazonaws&logoColor=white)](https://aws.amazon.com/ec2)
+[![AWS Lambda](https://img.shields.io/badge/AWS-Lambda-ff9900?style=flat-square&logo=awslambda&logoColor=white)](https://aws.amazon.com/lambda)
+[![CloudFront](https://img.shields.io/badge/AWS-CloudFront-ff9900?style=flat-square&logo=amazonaws&logoColor=white)](https://aws.amazon.com/cloudfront)
+[![S3](https://img.shields.io/badge/AWS-S3-ff9900?style=flat-square&logo=amazons3&logoColor=white)](https://aws.amazon.com/s3)
+
+---
+
+## The Problem
+
+Getting a campsite at Yosemite is genuinely difficult. Reservations sell out within seconds of opening each month, and the only tool recreation.gov offers is a basic alert system — capped at 3 alerts, slow to notify, and with no direct link to book when something opens up.
+
+Cancellations happen constantly. The problem isn't availability — it's speed. By the time most people see a notification, the site is already gone. I'd missed sites more than once because of it, so I decided to build something that actually worked.
+
+| | recreation.gov | Boondockr |
+|---|---|---|
+| Max alerts | 3 | Unlimited |
+| Poll interval | Unknown (slow) | Every 60–90 seconds |
+| Direct booking link | No | Yes |
+| Weekday/weekend filter | No | Yes |
+| Alert spam | Yes | Once per site, forever |
+
+---
+
+## Architecture
+
+Every component runs on AWS — from the Python script polling recreation.gov to the HTTPS-secured control panel.
+
+```
+User Browser
+     │
+     ▼
+CloudFront (HTTPS CDN)
+     │
+     ▼
+S3 (Dashboard — index.html)
+     │
+     ▼ API calls
+API Gateway (REST endpoints)
+     │
+     ▼
+Lambda (Python 3.11)
+     │
+     ▼
+SSM (Secure remote execution)
+     │
+     ▼
+EC2 t2.micro (Ubuntu 22.04 — 24/7)
+     │
+     ├── boondockr.py (Polling engine)
+     │        │
+     │        ├── Recreation.gov API ──► JSON availability data
+     │        │
+     │        └── Gmail SMTP ──► User inbox
+     │
+     ├── config.yaml (Users & campgrounds)
+     └── alerted_sites.json (Persistent alert history)
+```
+
+### AWS Services
+
+| Service | Role | Purpose |
+|---|---|---|
+| **EC2** | Compute | Ubuntu t2.micro running 24/7, hosts the Python polling script |
+| **Lambda** | Serverless | Receives dashboard commands and executes them on EC2 via SSM |
+| **API Gateway** | REST API | Gives Lambda a public URL — routes `/status`, `/check`, `/clear`, `/save-config` |
+| **S3** | Static hosting | Hosts the dashboard HTML file |
+| **CloudFront** | CDN + HTTPS | Sits in front of S3, adds SSL, distributes globally |
+| **SSM** | Remote execution | Lets Lambda run shell commands on EC2 without exposing SSH |
+| **IAM** | Permissions | Least privilege roles for every service |
+| **CloudWatch** | Logging | Captures Lambda logs for debugging |
 
 ---
 
 ## Features
 
-- ⚡ **2-3 minute polling** with human-like random delays
-- 📧 **Email alerts** via Gmail with direct booking link
-- 🏕️ **Multiple campgrounds** — watch as many as you want
-- 👥 **Multi-user** — one server covers all your friends
-- 📅 **Weekday/Weekend filtering**
-- 🚫 **Blackout dates**
-- 🏆 **Priority ranking**
-- 🛡️ **Flood protection** on monthly releases
-- ⏰ **Monthly reminders** — 1hr + 15min warning on the 15th
-- 📊 **Daily digest** — 8am heartbeat email
-- ⚠️ **Downtime alerts**
-- 🔄 **Exponential backoff** with jitter on rate limits
+- **Real-time polling** — Checks recreation.gov every 60–90 seconds with randomized delays to avoid rate limiting
+- **Smart email alerts** — One summary email per poll cycle, available dates grouped into ranges (May 7–9 instead of individual days)
+- **Alert once per site** — Persistent tracking on disk, no repeat notifications across restarts
+- **Flood protection** — Detects monthly release spikes (10+ sites at once) and sends a single summary
+- **Manual re-check** — Force a fresh check via `python3 boondockr.py --check` or the dashboard button
+- **Live control panel** — HTTPS dashboard to add campgrounds, manage users, and trigger commands without SSHing in
+- **Daily digest** — Morning summary email confirming the app is running
+- **Monthly reminders** — 1-hour and 15-minute warnings before the 15th of each month release
+
+---
+
+## Engineering Challenges
+
+Every problem below came up in production and was diagnosed from logs without a guide.
+
+**01 — 400 errors on every API request**
+Recreation.gov silently requires browser-like headers. Fixed by adding `User-Agent`, `Accept`, `Referer`, and `Origin` to match what a real browser sends.
+
+**02 — 429 rate limiting**
+After heavy testing the server IP got flagged. Fixed with Tenacity exponential backoff, `Retry-After` header support, and randomized 8–20 second delays between requests.
+
+**03 — Email hanging indefinitely**
+DigitalOcean blocks outbound SMTP ports 465 and 587 by default. Fixed by migrating to AWS EC2 which doesn't have this restriction, plus adding a 10-second connection timeout.
+
+**04 — SSM credential errors**
+The SSM agent was running but couldn't authenticate. Fixed by creating an IAM role with `AmazonSSMManagedInstanceCore`, building an instance profile, and attaching it to the EC2 instance via CLI.
+
+**05 — CORS blocking dashboard calls**
+The browser blocked cross-origin requests with "Failed to fetch". Fixed by adding an OPTIONS method with MOCK integration to API Gateway and configuring `Access-Control-Allow-Origin` headers on all Lambda responses.
+
+---
+
+## Deployment
+
+Everything was provisioned using the AWS CLI — no console clicking.
+
+```bash
+# Create and configure S3 website
+aws s3 mb s3://boondockr-ui --region us-east-1
+aws s3 website s3://boondockr-ui --index-document index.html
+
+# Deploy CloudFront with HTTPS
+aws cloudfront create-distribution \
+  --origin-domain-name boondockr-ui.s3-website-us-east-1.amazonaws.com
+
+# Create IAM roles
+aws iam create-role --role-name boondockr-lambda-role \
+  --assume-role-policy-document file://trust-policy.json
+aws iam attach-role-policy --role-name boondockr-lambda-role \
+  --policy-arn arn:aws:iam::aws:policy/AmazonSSMFullAccess
+
+# Deploy Lambda
+aws lambda create-function \
+  --function-name boondockr-api \
+  --runtime python3.11 \
+  --handler lambda_function.lambda_handler \
+  --zip-file fileb://lambda.zip
+
+# Create and deploy API Gateway
+aws apigateway create-rest-api --name boondockr-api
+aws apigateway create-deployment --rest-api-id <id> --stage-name prod
+```
 
 ---
 
 ## Setup Guide
 
-### Step 1 — Install Python 3
+### Prerequisites
+- AWS account
+- Python 3.8+
+- Gmail account with 2-Step Verification enabled
+
+### 1 — Clone and install dependencies
+
 ```bash
-python3 --version
+git clone https://github.com/tylerjacevedo/boondockr.git
+cd boondockr
+pip3 install -r requirements.txt
 ```
 
-### Step 2 — Upload files to your server
-```bash
-scp -i ~/path/to/key.pem -r ~/boondockr ubuntu@YOUR_IP:/home/ubuntu/boondockr
-```
+### 2 — Configure credentials
 
-### Step 3 — Install dependencies
-```bash
-cd /home/ubuntu/boondockr
-pip3 install -r requirements.txt --break-system-packages
-```
-
-### Step 4 — Set up Gmail App Password
-1. Enable 2-Step Verification at: https://myaccount.google.com/security
-2. Create an App Password at: https://myaccount.google.com/apppasswords
-3. Name it "Boondockr" and copy the 16-character password
-
-### Step 5 — Create your .env file
 ```bash
 cp .env.example .env
-nano .env
 ```
-Fill in:
+
+Edit `.env`:
 ```
 GMAIL_ADDRESS=you@gmail.com
 GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx
 ```
 
-### Step 6 — Configure your users and campgrounds
-```bash
-nano config.yaml
+Get your Gmail App Password at: https://myaccount.google.com/apppasswords
+
+### 3 — Configure campgrounds and users
+
+Edit `config.yaml`:
+
+```yaml
+users:
+  - name: "Tyler"
+    email: "you@gmail.com"
+    watching: [232447, 232450]
+
+campgrounds:
+  - id: 232447
+    name: "Upper Pines — Yosemite"
+    date_start: "2026-05-01"
+    date_end: "2026-11-30"
+    site: null          # null = any available site
+    day_filter: "all"   # "all" | "weekends" | "weekdays"
+    blackout_dates: []
+    priority: 1
 ```
 
-### Step 7 — Test email
-```bash
-python3 etest.py
-```
+### 4 — Deploy to EC2
 
-### Step 8 — Run Boondockr
 ```bash
+# Upload files
+scp -i your-key.pem -r . ubuntu@YOUR_EC2_IP:/home/ubuntu/boondockr
+
+# SSH in and start
+ssh -i your-key.pem ubuntu@YOUR_EC2_IP
+cd /home/ubuntu/boondockr
+pip3 install -r requirements.txt
 screen -S boondockr
 python3 boondockr.py
+# Ctrl+A then D to detach
 ```
-Detach: **Ctrl + A then D**
 
----
-
-## Common Yosemite Campground IDs
+### Common Yosemite Campground IDs
 
 | Campground | ID |
 |---|---|
@@ -89,95 +222,34 @@ Detach: **Ctrl + A then D**
 
 ---
 
-## Server Commands
+## Version History
 
-| Command | What it does |
+| Version | What changed |
 |---|---|
-| `screen -S boondockr` | Start a new session |
-| `screen -r boondockr` | Reattach to view logs |
-| `Ctrl + A then D` | Detach safely |
-| `pkill -f boondockr.py` | Stop Boondockr |
-| `screen -ls` | List all sessions |
-| `screen -X -S boondockr quit` | Kill session |
+| **v1.0** | Core polling engine. Twilio SMS + SendGrid email. Multi-user config. Flood protection. Daily digest. Monthly reminders. |
+| **v1.1** | Migrated from DigitalOcean to AWS EC2. Replaced Twilio/SendGrid with Gmail SMTP. Added Tenacity exponential backoff. |
+| **v1.2** | One summary email per cycle. Consecutive date grouping (May 7–9). 24-hour alert cooldown. New HTML email design. |
+| **v1.3** | Persistent alert tracking with `alerted_sites.json`. Alert once per site forever. Added `--check` manual re-check flag. |
+| **v2.0** | Full-stack AWS dashboard. S3 + CloudFront frontend. Lambda + API Gateway backend. SSM remote command execution. Live server status. |
 
 ---
 
-## Updating Config (Adding/Removing Friends or Campgrounds)
-
-```bash
-pkill -f boondockr.py
-nano /home/ubuntu/boondockr/config.yaml
-# make your changes
-screen -S boondockr
-python3 boondockr.py
-# Ctrl + A then D
-```
-
----
-
-## Hurdles Solved During Development
-
-### 1. Recreation.gov API — 400 Bad Request
-**Problem:** The API was returning 400 errors on every request.
-**Cause:** Missing browser-like headers. Recreation.gov blocks requests that don't look like a real browser.
-**Fix:** Added full browser headers including User-Agent, Accept, Referer, Origin, and Connection.
-
-### 2. Recreation.gov API — 429 Too Many Requests
-**Problem:** After heavy testing, the server IP got rate limited.
-**Cause:** Too many rapid requests in a short period during development and testing.
-**Fix:** Implemented exponential backoff with jitter using Tenacity, Retry-After header support, 8-20 second delays between campground requests, and increased poll interval to 120-180 seconds.
-
-### 3. Email Hanging Indefinitely
-**Problem:** App would freeze for minutes when trying to send email.
-**Cause:** DigitalOcean blocks outbound SMTP ports 465 and 587 by default.
-**Fix:** Switched from DigitalOcean to AWS EC2 which has SMTP ports open by default. Also added a 10 second timeout to prevent future hangs.
-
-### 4. SendGrid 401 Unauthorized
-**Problem:** Email alerts failing with HTTP 401 error.
-**Cause:** SendGrid account couldn't be created due to login restrictions, and the API key was never set up.
-**Fix:** Replaced SendGrid entirely with Gmail SMTP using a Google App Password. Free, simple, and no account approval needed.
-
-### 5. Twilio SMS — Toll-Free Verification Pending
-**Problem:** SMS alerts not delivering despite successful API calls.
-**Cause:** Twilio requires toll-free numbers to go through a verification process before they can send SMS.
-**Fix:** Removed Twilio from v1.1. SMS can be re-added in a future version once verification is approved or a local number is purchased.
-
-### 6. Multiple Screen Sessions
-**Problem:** Multiple instances of Boondockr running simultaneously.
-**Cause:** Restarting without killing old sessions.
-**Fix:** Always run `pkill -f boondockr.py` before restarting. Use `screen -ls` to check for existing sessions.
-
-### 7. YAML Config Formatting Errors
-**Problem:** App crashing with YAML scanner errors on startup.
-**Cause:** Missing spaces after colons (e.g. `blackout_dates:[]` instead of `blackout_dates: []`).
-**Fix:** Always use a space after the colon in YAML. Use `cat config.yaml` to verify before restarting.
-
-### 8. Placeholder Users in Config
-**Problem:** Twilio hitting 50 SMS/day trial limit.
-**Cause:** Placeholder friend entries with fake numbers were still active in config.yaml.
-**Fix:** Comment out placeholder users with # until real friends are added.
-
----
-
-## Monthly Cost (AWS EC2)
+## Monthly Cost
 
 | Item | Cost |
 |---|---|
-| AWS EC2 t2.micro | Free (12 months) then ~$8-10/mo |
+| AWS EC2 t2.micro | Free (12 months) then ~$8–10/mo |
 | Gmail SMTP | Free |
-| **Total year 1** | **~$0/mo** |
-| **Total after year 1** | **~$8-10/mo** |
+| S3 + CloudFront | ~$0.50/mo |
+| **Total year 1** | **~$0.50/mo** |
 
 ---
 
-## Versioning
+## Why I Built This
 
-```bash
-git add .
-git commit -m "describe your change"
-git tag v1.2
-git push && git push --tags
-```
+Getting into Yosemite without a reservation is nearly impossible in the summer. The official alert system is slow, limited, and doesn't give you a direct link to book when something opens up.
+
+I decided to solve the problem properly — understanding how recreation.gov's API actually works, figuring out how to run something reliably in the cloud, and building a system that would notify me the moment a site opened. The AWS CLI kept the whole setup reproducible and fast to iterate on. Each engineering challenge that came up in production taught something that a tutorial never would.
 
 ---
 
